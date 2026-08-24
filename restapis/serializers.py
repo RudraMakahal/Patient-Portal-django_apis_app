@@ -2,7 +2,70 @@ from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
+from .models import AppointmentRequest, ProviderProfile, ProviderRequest
+
 User = get_user_model()
+
+
+class ProviderProfileSerializer(serializers.ModelSerializer):
+    full_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProviderProfile
+        fields = ["id", "full_name", "email", "specialty", "license_number"]
+
+    def get_full_name(self, obj):
+        return obj.full_name
+
+
+class ProviderRequestSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProviderRequest
+        fields = [
+            "id",
+            "first_name",
+            "last_name",
+            "email",
+            "specialty",
+            "license_number",
+            "message",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "status", "created_at", "updated_at"]
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            validated_data["patient"] = request.user
+        return super().create(validated_data)
+
+
+class AppointmentRequestSerializer(serializers.ModelSerializer):
+    provider_name = serializers.CharField(required=False, allow_blank=True)
+    reason = serializers.CharField(required=True, allow_blank=False)
+
+    class Meta:
+        model = AppointmentRequest
+        fields = [
+            "id",
+            "preferred_date",
+            "preferred_time",
+            "provider_name",
+            "appointment_type",
+            "reason",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "status", "created_at", "updated_at"]
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            validated_data["patient"] = request.user
+        return super().create(validated_data)
 
 
 class ProfileSerializer(serializers.ModelSerializer):
