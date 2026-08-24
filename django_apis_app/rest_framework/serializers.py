@@ -67,6 +67,8 @@ from rest_framework.fields import (  # NOQA # isort:skip
     CreateOnlyDefault, CurrentUserDefault, SkipField, empty
 )
 from rest_framework.relations import Hyperlink, PKOnlyObject  # NOQA # isort:skip
+from django.contrib.auth import authenticate
+from rest_framework import serializers
 
 # We assume that 'validators' are intended for the child serializer,
 # rather than the parent serializer.
@@ -1763,3 +1765,32 @@ class HyperlinkedModelSerializer(ModelSerializer):
         field_kwargs = get_nested_relation_kwargs(relation_info)
 
         return field_class, field_kwargs
+
+
+class LoginSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        email = attrs["email"]
+        password = attrs["password"]
+
+        user = authenticate(
+            request=self.context.get("request"),
+            username=email,
+            password=password,
+        )
+
+        if not user:
+            raise serializers.ValidationError(
+                "Invalid email or password."
+            )
+
+        if not user.is_active:
+            raise serializers.ValidationError(
+                "User account is inactive."
+            )
+
+        attrs["user"] = user
+        return attrs
+

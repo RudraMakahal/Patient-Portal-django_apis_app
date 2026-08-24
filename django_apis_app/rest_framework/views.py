@@ -19,6 +19,10 @@ from rest_framework.schemas import DefaultSchema
 from rest_framework.settings import api_settings
 from rest_framework.utils import formatting
 
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework_simplejwt.tokens import RefreshToken
 
 def get_view_name(view):
     """
@@ -536,3 +540,33 @@ class APIView(View):
             return self.http_method_not_allowed(request, *args, **kwargs)
         data = self.metadata_class().determine_metadata(request, self)
         return Response(data, status=status.HTTP_200_OK)
+
+from .serializers import LoginSerializer
+
+
+class LoginAPIView(APIView):
+
+    def post(self, request):
+        serializer = LoginSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+
+        serializer.is_valid(raise_exception=True)
+
+        user = serializer.validated_data["user"]
+
+        refresh = RefreshToken.for_user(user)
+
+        return Response(
+            {
+                "message": "Login successful",
+                "user": {
+                    "id": user.id,
+                    "email": user.email,
+                },
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+            },
+            status=status.HTTP_200_OK,
+        )

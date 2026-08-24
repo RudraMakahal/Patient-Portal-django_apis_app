@@ -3,6 +3,8 @@
 *~
 *.py.bak
 
+*__*
+
 
 /site/
 /htmlcov/
