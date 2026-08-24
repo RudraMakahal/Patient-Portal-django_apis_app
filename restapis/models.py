@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.db import models
+from django.db.models import Q
 
 
 class ProviderProfile(models.Model):
@@ -110,6 +111,13 @@ class AppointmentRequest(models.Model):
 
     class Meta:
         ordering = ["preferred_date", "preferred_time"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider_name", "preferred_date", "preferred_time"],
+                condition=Q(status="Confirmed"),
+                name="unique_confirmed_provider_slot",
+            )
+        ]
 
     def __str__(self):
         return f"{self.patient.username} - {self.appointment_type} ({self.status})"

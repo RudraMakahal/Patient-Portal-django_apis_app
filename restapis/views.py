@@ -1,4 +1,10 @@
+import logging
+import logging
+from datetime import datetime
+from urllib import request
+
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -16,6 +22,33 @@ from .serializers import (
 )
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
+
+
+def has_confirmed_slot_conflict(provider_name, preferred_date, preferred_time, exclude_id=None):
+    queryset = AppointmentRequest.objects.filter(
+        provider_name__iexact=provider_name,
+        preferred_date=preferred_date,
+        preferred_time=preferred_time,
+        status=AppointmentRequest.STATUS_CONFIRMED,
+    )
+    if exclude_id is not None:
+        queryset = queryset.exclude(pk=exclude_id)
+    return queryset.exists()
+
+
+def send_appointment_notification(appointment):
+    patient_name = " ".join(
+        part for part in [appointment.patient.first_name, appointment.patient.last_name] if part
+    ).strip() or appointment.patient.username
+    recipient = appointment.patient.email or appointment.patient.username
+    message = (
+        f"Would send appointment confirmation email to {recipient} "
+        f"for {patient_name}: appointment is confirmed for {appointment.preferred_date} "
+        f"at {appointment.preferred_time}."
+    )
+    logger.info(message)
+    return message
 
 
 class ProviderRequestCreateAPIView(APIView):
@@ -35,7 +68,7 @@ class ProviderRequestCreateAPIView(APIView):
         }, status=status.HTTP_200_OK)
 
     def post(self, request):
-        if ProviderRequest.objects.filter(patient=request.user).exists() or ProviderProfile.objects.filter(user=request.user).exists():
+        if ProviderRequest.objects.filter(patient=request.user).exists():
             return Response(
                 {"detail": "Your provider application is already tracked."},
                 status=status.HTTP_409_CONFLICT,
@@ -49,15 +82,6 @@ class ProviderRequestCreateAPIView(APIView):
         provider_request = serializer.save()
         provider_request.status = ProviderRequest.STATUS_APPROVED
         provider_request.save(update_fields=["status", "updated_at"])
-
-        ProviderProfile.objects.create(
-            user=request.user,
-            first_name=provider_request.first_name,
-            last_name=provider_request.last_name,
-            email=provider_request.email,
-            specialty=provider_request.specialty,
-            license_number=provider_request.license_number,
-        )
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -76,20 +100,21 @@ class ProviderAppointmentListAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        provider_profile = ProviderProfile.objects.filter(user=request.user).first()
+        provider_request = ProviderRequest.objects.filter(
+            patient=request.user,
+            status=ProviderRequest.STATUS_APPROVED,
+        ).first()
         provider_name = ""
 
-        if provider_profile:
-            provider_name = provider_profile.full_name
+        if provider_request:
+            provider_name = " ".join(
+                part for part in [provider_request.first_name, provider_request.last_name] if part
+            ).strip() or request.user.username
         else:
             full_name = " ".join(
                 part for part in [request.user.first_name, request.user.last_name] if part
             ).strip()
-            if full_name:
-                provider_name = full_name
-            else:
-                provider_name = request.user.username
-        print(f"Searching for appointments with provider name: {provider_name}")
+            provider_name = full_name or request.user.username
 
         appointments = AppointmentRequest.objects.filter(provider_name__icontains=provider_name)
         serializer = AppointmentRequestSerializer(appointments, many=True)
@@ -114,6 +139,19 @@ class AppointmentListCreateAPIView(APIView):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
+def parse_version(value):
+    if not value:
+        return None
+
+    if isinstance(value, str):
+        value = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return value
+
+
 class AppointmentCancelAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -122,6 +160,16 @@ class AppointmentCancelAPIView(APIView):
             appointment = AppointmentRequest.objects.get(pk=pk, patient=request.user)
         except AppointmentRequest.DoesNotExist:
             return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        base_updated_at = parse_version(request.data.get("base_updated_at"))
+        if base_updated_at and appointment.updated_at and appointment.updated_at > base_updated_at:
+            return Response(
+                {
+                    "detail": "This appointment changed while you were viewing it. Please refresh and try again.",
+                    "stale": True,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
 
         if appointment.status != AppointmentRequest.STATUS_CONFIRMED:
             return Response(
@@ -144,15 +192,27 @@ class AppointmentProviderActionAPIView(APIView):
         except AppointmentRequest.DoesNotExist:
             return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        provider_profile = ProviderRequest.objects.filter(first_name=request.user.first_name, last_name=request.user.last_name).first()
-        if not provider_profile:
+        base_updated_at = parse_version(request.data.get("base_updated_at"))
+        if base_updated_at and appointment.updated_at and appointment.updated_at > base_updated_at:
+            return Response(
+                {
+                    "detail": "This appointment changed while you were viewing it. Please refresh and try again.",
+                    "stale": True,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        provider_request = ProviderRequest.objects.filter(
+            patient=request.user,
+            status=ProviderRequest.STATUS_APPROVED,
+        ).first()
+        if not provider_request:
             return Response(
                 {"detail": "Only approved providers can manage appointments."},
                 status=status.HTTP_403_FORBIDDEN,
             )
         provider_name = " ".join(
-            part for part in [provider_profile.first_name, provider_profile.last_name] if part
-        ).strip()
+            part for part in [provider_request.first_name, provider_request.last_name] if part
+        ).strip() or request.user.username
 
         if appointment.provider_name and appointment.provider_name.strip() and appointment.provider_name.strip().lower() != provider_name.lower():
             return Response(
@@ -167,8 +227,30 @@ class AppointmentProviderActionAPIView(APIView):
                     {"detail": "Cancelled appointments cannot be confirmed."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            appointment.status = AppointmentRequest.STATUS_CONFIRMED
-            appointment.save(update_fields=["status", "updated_at"])
+
+            with transaction.atomic():
+                AppointmentRequest.objects.select_for_update().filter(pk=appointment.pk).exists()
+                if has_confirmed_slot_conflict(
+                    provider_name,
+                    appointment.preferred_date,
+                    appointment.preferred_time,
+                    exclude_id=appointment.pk,
+                ):
+                    return Response(
+                        {
+                            "detail": "This provider already has a confirmed appointment at that date and time.",
+                            "conflict": True,
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                appointment.status = AppointmentRequest.STATUS_CONFIRMED
+                appointment.save(update_fields=["status", "updated_at"])
+
+            try:
+                send_appointment_notification(appointment)
+            except Exception:
+                logger.exception("Appointment confirmation notification failed for appointment %s", appointment.id)
             serializer = AppointmentRequestSerializer(appointment)
             return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -187,9 +269,25 @@ class AppointmentProviderActionAPIView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            appointment.preferred_date = preferred_date
-            appointment.preferred_time = preferred_time
-            appointment.save(update_fields=["preferred_date", "preferred_time", "updated_at"])
+            with transaction.atomic():
+                AppointmentRequest.objects.select_for_update().filter(pk=appointment.pk).exists()
+                if has_confirmed_slot_conflict(
+                    provider_name,
+                    preferred_date,
+                    preferred_time,
+                    exclude_id=appointment.pk,
+                ):
+                    return Response(
+                        {
+                            "detail": "This provider already has a confirmed appointment at that date and time.",
+                            "conflict": True,
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                appointment.preferred_date = preferred_date
+                appointment.preferred_time = preferred_time
+                appointment.save(update_fields=["preferred_date", "preferred_time", "updated_at"])
             serializer = AppointmentRequestSerializer(appointment)
             return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -221,21 +319,24 @@ class ProviderDashboardAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        provider_profile = ProviderRequest.objects.filter(first_name=request.user.first_name, last_name=request.user.last_name).first()
-        if not provider_profile:
+        provider_request = ProviderRequest.objects.filter(
+            patient=request.user,
+            status=ProviderRequest.STATUS_APPROVED,
+        ).first()
+        if not provider_request:
             return Response(
                 {"detail": "Provider profile not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
         provider_name = " ".join(
-            part for part in [provider_profile.first_name, provider_profile.last_name] if part
-        ).strip()
+            part for part in [provider_request.first_name, provider_request.last_name] if part
+        ).strip() or request.user.username
         appointments = AppointmentRequest.objects.filter(provider_name__icontains=provider_name)
 
         return Response(
             {
-                "provider": ProviderRequestSerializer(provider_profile).data,
+                "provider": ProviderRequestSerializer(provider_request).data,
                 "appointments": AppointmentRequestSerializer(appointments, many=True).data,
             },
             status=status.HTTP_200_OK,
