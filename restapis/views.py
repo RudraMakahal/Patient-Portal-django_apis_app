@@ -11,7 +11,7 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import AppointmentRequest, ProviderProfile, ProviderRequest
+from .models import ActivityLog, AppointmentRequest, ProviderProfile, ProviderRequest
 from .serializers import (
     LoginSerializer,
     RegisterSerializer,
@@ -23,6 +23,28 @@ from .serializers import (
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
+
+
+def get_client_ip(request):
+    forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.META.get("REMOTE_ADDR") or "unknown"
+
+
+def log_activity(request=None, user=None, action="", detail=""):
+    actor = user
+    if actor is None and request is not None:
+        actor = getattr(request, "user", None)
+    try:
+        ActivityLog.objects.create(
+            actor=actor,
+            action=action,
+            detail=detail,
+            ip_address=get_client_ip(request) if request is not None else None,
+        )
+    except Exception:
+        logger.exception("Failed to write activity log for action %s", action)
 
 
 def has_confirmed_slot_conflict(provider_name, preferred_date, preferred_time, exclude_id=None):
@@ -37,15 +59,16 @@ def has_confirmed_slot_conflict(provider_name, preferred_date, preferred_time, e
     return queryset.exists()
 
 
-def send_appointment_notification(appointment):
+def send_appointment_notification(appointment, action, extra_message=""):
     patient_name = " ".join(
         part for part in [appointment.patient.first_name, appointment.patient.last_name] if part
     ).strip() or appointment.patient.username
     recipient = appointment.patient.email or appointment.patient.username
+    action_label = action.lower().replace("_", " ")
+    summary = extra_message.strip()
     message = (
-        f"Would send appointment confirmation email to {recipient} "
-        f"for {patient_name}: appointment is confirmed for {appointment.preferred_date} "
-        f"at {appointment.preferred_time}."
+        f"Would send appointment {action_label} email to {recipient} "
+        f"for {patient_name}: {summary or f'appointment scheduled for {appointment.preferred_date} at {appointment.preferred_time}.'}"
     )
     logger.info(message)
     return message
@@ -82,6 +105,12 @@ class ProviderRequestCreateAPIView(APIView):
         provider_request = serializer.save()
         provider_request.status = ProviderRequest.STATUS_APPROVED
         provider_request.save(update_fields=["status", "updated_at"])
+        log_activity(
+            request=request,
+            user=request.user,
+            action="provider_request_approved",
+            detail=f"Provider request approved and submitted for {provider_request.first_name} {provider_request.last_name}.",
+        )
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -135,7 +164,24 @@ class AppointmentListCreateAPIView(APIView):
             context={"request": request},
         )
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        appointment = serializer.save()
+        log_activity(
+            request=request,
+            user=request.user,
+            action="appointment_created",
+            detail=(
+                f"Created appointment for {appointment.preferred_date} at {appointment.preferred_time} "
+                f"with provider {appointment.provider_name or 'unassigned'} for {appointment.appointment_type}."
+            ),
+        )
+        try:
+            send_appointment_notification(
+                appointment,
+                "created",
+                f"new appointment request received for {appointment.appointment_type}.",
+            )
+        except Exception:
+            logger.exception("Appointment creation notification failed for appointment %s", appointment.id)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -179,6 +225,23 @@ class AppointmentCancelAPIView(APIView):
 
         appointment.status = AppointmentRequest.STATUS_CANCELLED
         appointment.save(update_fields=["status", "updated_at"])
+        log_activity(
+            request=request,
+            user=request.user,
+            action="appointment_cancelled",
+            detail=(
+                f"Cancelled appointment on {appointment.preferred_date} at {appointment.preferred_time} "
+                f"for provider {appointment.provider_name or 'unassigned'}."
+            ),
+        )
+        try:
+            send_appointment_notification(
+                appointment,
+                "cancelled",
+                f"your appointment on {appointment.preferred_date} at {appointment.preferred_time} was cancelled.",
+            )
+        except Exception:
+            logger.exception("Appointment cancellation notification failed for appointment %s", appointment.id)
         serializer = AppointmentRequestSerializer(appointment)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -247,8 +310,21 @@ class AppointmentProviderActionAPIView(APIView):
                 appointment.status = AppointmentRequest.STATUS_CONFIRMED
                 appointment.save(update_fields=["status", "updated_at"])
 
+            log_activity(
+                request=request,
+                user=request.user,
+                action="appointment_confirmed",
+                detail=(
+                    f"Confirmed appointment for patient {appointment.patient.username} on {appointment.preferred_date} "
+                    f"at {appointment.preferred_time}."
+                ),
+            )
             try:
-                send_appointment_notification(appointment)
+                send_appointment_notification(
+                    appointment,
+                    "confirmed",
+                    f"your appointment has been confirmed for {appointment.preferred_date} at {appointment.preferred_time}.",
+                )
             except Exception:
                 logger.exception("Appointment confirmation notification failed for appointment %s", appointment.id)
             serializer = AppointmentRequestSerializer(appointment)
@@ -288,6 +364,24 @@ class AppointmentProviderActionAPIView(APIView):
                 appointment.preferred_date = preferred_date
                 appointment.preferred_time = preferred_time
                 appointment.save(update_fields=["preferred_date", "preferred_time", "updated_at"])
+            log_activity(
+                request=request,
+                user=request.user,
+                action="appointment_rescheduled",
+                detail=(
+                    f"Rescheduled appointment for patient {appointment.patient.username} from "
+                    f"{appointment.preferred_date} at {appointment.preferred_time} to "
+                    f"{preferred_date} at {preferred_time}."
+                ),
+            )
+            try:
+                send_appointment_notification(
+                    appointment,
+                    "rescheduled",
+                    f"your appointment was rescheduled to {appointment.preferred_date} at {appointment.preferred_time}.",
+                )
+            except Exception:
+                logger.exception("Appointment reschedule notification failed for appointment %s", appointment.id)
             serializer = AppointmentRequestSerializer(appointment)
             return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -358,6 +452,12 @@ class ProfileAPIView(APIView):
         )
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        log_activity(
+            request=request,
+            user=request.user,
+            action="profile_updated",
+            detail="User updated profile information.",
+        )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
@@ -373,6 +473,12 @@ class LoginAPIView(APIView):
         serializer.is_valid(raise_exception=True)
 
         user = serializer.validated_data["user"]
+        log_activity(
+            request=request,
+            user=user,
+            action="login",
+            detail="User logged in successfully.",
+        )
 
         refresh = RefreshToken.for_user(user)
 
@@ -399,6 +505,12 @@ class RegisterAPIView(APIView):
         serializer.is_valid(raise_exception=True)
 
         user = serializer.save()
+        log_activity(
+            request=request,
+            user=user,
+            action="register",
+            detail="User registered a new account.",
+        )
         refresh = RefreshToken.for_user(user)
 
         return Response(
